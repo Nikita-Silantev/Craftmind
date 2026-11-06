@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "craftmind",
+  "version": "${version}",
+  "name": "Craftmind",
+  "description": "Local AI agents for Minecraft",
+  "authors": ["Nikita Silantev"],
+  "contact": {"sources": "https://github.com/Nikita-Silantev/Craftmind"},
+  "environment": "*",
+  "entrypoints": {"main": ["dev.craftmind.CraftmindMod"]},
+  "depends": {
+    "fabricloader": ">=0.20.1",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
