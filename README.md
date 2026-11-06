@@ -2,12 +2,12 @@
 
 Craftmind is an early prototype for playing Minecraft Java Edition with a local AI agent. The target is a named, Steve-skinned companion that follows chat commands in a single-player world.
 
-Development currently happens on `dev`. The first milestone is a Fabric mod with `/craftmind status`; it does not spawn or control an agent yet. See [plan.md](plan.md) for the roadmap.
+Development currently happens on `dev`. The first prototype spawns a bot through Fabric Carpet and accepts simple chat commands. Resource gathering and autonomous play are not implemented yet. See [plan.md](plan.md) for the roadmap.
 
 ## Build the prototype mod
 
-Requires JDK 21 or newer. From `mod/`, run `./gradlew build` on macOS/Linux or `gradlew.bat build` on Windows. The mod targets Minecraft 1.21.11 with Fabric API. The JAR is produced in `mod/build/libs/`.
+Requires JDK 21 or newer. From `mod/`, run `./gradlew build` on macOS/Linux or `gradlew.bat build` on Windows. The mod targets Minecraft 1.21.11 with Fabric API and Carpet 1.4.194. The JAR is produced in `mod/build/libs/`.
 
 ## Status
 
-The chat command `/craftmind status` confirms that the mod loaded. This is a development check, not a playable AI release.
+See [the Windows first-test guide](docs/first-test.md). In-game behavior has not yet been manually verified; the mod builds and Python tests pass.
