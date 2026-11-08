@@ -12,6 +12,12 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -23,9 +29,13 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 public final class CraftmindMod implements ModInitializer {
@@ -35,6 +45,7 @@ public final class CraftmindMod implements ModInitializer {
     private static final Gson GSON = new Gson();
     private final ConcurrentLinkedQueue<Map<String, String>> events = new ConcurrentLinkedQueue<>();
     private HttpServer bridge;
+    private ExecutorService bridgeExecutor;
     private MinecraftServer server;
     private long ticks;
     private long stopAtTick;
@@ -98,7 +109,8 @@ public final class CraftmindMod implements ModInitializer {
             bridge.createContext("/state", this::handleState);
             bridge.createContext("/action", this::handleAction);
             bridge.createContext("/reply", this::handleReply);
-            bridge.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
+            bridgeExecutor = Executors.newCachedThreadPool();
+            bridge.setExecutor(bridgeExecutor);
             bridge.start();
             LOGGER.info("Craftmind bridge listening on 127.0.0.1:8765");
         } catch (IOException e) {
@@ -108,8 +120,11 @@ public final class CraftmindMod implements ModInitializer {
 
     private void stopBridge() {
         if (bridge != null) bridge.stop(0);
+        if (bridgeExecutor != null) bridgeExecutor.shutdownNow();
         bridge = null;
+        bridgeExecutor = null;
         server = null;
+        stopAtTick = 0;
         events.clear();
     }
 
@@ -130,10 +145,73 @@ public final class CraftmindMod implements ModInitializer {
             Map<String, Object> state = server.submit(() -> {
                 ServerPlayer bot = server.getPlayerList().getPlayerByName(BOT_NAME);
                 if (bot == null) return Map.<String, Object>of("bot", "absent");
-                return Map.<String, Object>of("bot", "present", "x", bot.getX(), "y", bot.getY(), "z", bot.getZ(), "health", bot.getHealth());
+                return observe(bot);
             }).get(3, TimeUnit.SECONDS);
             respond(exchange, 200, state);
         } catch (Exception e) { respond(exchange, 500, Map.of("error", e.toString())); }
+    }
+
+    private Map<String, Object> observe(ServerPlayer bot) {
+        Map<String, Object> state = new HashMap<>();
+        state.put("bot", "present");
+        state.put("x", Math.round(bot.getX() * 10) / 10.0);
+        state.put("y", Math.round(bot.getY() * 10) / 10.0);
+        state.put("z", Math.round(bot.getZ() * 10) / 10.0);
+        state.put("facing_degrees", bot.getYRot());
+        state.put("health", bot.getHealth());
+        state.put("food", bot.getFoodData().getFoodLevel());
+        state.put("sprinting", bot.isSprinting());
+        if (bot.pick(6, 1.0f, false) instanceof BlockHitResult hit) {
+            BlockPos target = hit.getBlockPos();
+            state.put("target_block", Map.of(
+                "id", BuiltInRegistries.BLOCK.getKey(bot.level().getBlockState(target).getBlock()).toString(),
+                "x", target.getX(), "y", target.getY(), "z", target.getZ()));
+        }
+
+        Map<String, Integer> inventory = new HashMap<>();
+        for (int slot = 0; slot < bot.getInventory().getContainerSize(); slot++) {
+            ItemStack stack = bot.getInventory().getItem(slot);
+            if (!stack.isEmpty()) {
+                String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+                inventory.merge(id, stack.getCount(), Integer::sum);
+            }
+        }
+        state.put("inventory", inventory);
+
+        BlockPos center = bot.blockPosition();
+        Map<String, Integer> counts = new HashMap<>();
+        Map<String, BlockPos> nearest = new HashMap<>();
+        for (int dx = -5; dx <= 5; dx++) {
+            for (int dy = -2; dy <= 3; dy++) {
+                for (int dz = -5; dz <= 5; dz++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    var block = bot.level().getBlockState(pos);
+                    if (block.isAir()) continue;
+                    String id = BuiltInRegistries.BLOCK.getKey(block.getBlock()).toString();
+                    counts.merge(id, 1, Integer::sum);
+                    if (!nearest.containsKey(id) || pos.distSqr(center) < nearest.get(id).distSqr(center)) nearest.put(id, pos);
+                }
+            }
+        }
+        List<Map<String, Object>> blocks = new ArrayList<>();
+        counts.keySet().stream().sorted(Comparator.comparingInt((String id) -> {
+            if (id.contains("_log") || id.contains("_ore") || id.contains("chest") || id.contains("lava") || id.contains("water")) return 0;
+            return 1;
+        }).thenComparing(id -> id)).limit(24).forEach(id -> {
+            BlockPos pos = nearest.get(id);
+            blocks.add(Map.of("id", id, "count", counts.get(id), "x", pos.getX(), "y", pos.getY(), "z", pos.getZ()));
+        });
+        state.put("nearby_blocks", blocks);
+
+        List<Map<String, Object>> entities = new ArrayList<>();
+        for (Entity entity : bot.level().getEntities(bot, AABB.ofSize(bot.position(), 12, 8, 12), e -> true)) {
+            if (entities.size() >= 12) break;
+            entities.add(Map.of("id", BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString(),
+                "x", Math.round(entity.getX()), "y", Math.round(entity.getY()), "z", Math.round(entity.getZ())));
+        }
+        state.put("nearby_entities", entities);
+        state.put("observation_note", "Nearby blocks/entities are a local sensor, including objects behind walls; not a camera image.");
+        return state;
     }
 
     private void handleAction(HttpExchange exchange) throws IOException {
@@ -142,14 +220,28 @@ public final class CraftmindMod implements ModInitializer {
         try {
             JsonObject input = GSON.fromJson(new String(body, StandardCharsets.UTF_8), JsonObject.class);
             String action = input.get("action").getAsString();
-            if (!List.of("forward", "back", "left", "right", "stop", "jump").contains(action)) {
+            if (!List.of("forward", "back", "left", "right", "sprint_forward", "turn_left", "turn_right", "stop", "jump", "attack", "mine", "use").contains(action)) {
                 respond(exchange, 400, Map.of("error", "unknown action")); return;
             }
             int result = server.submit(() -> {
                 ServerPlayer bot = server.getPlayerList().getPlayerByName(BOT_NAME);
                 if (bot == null) return 0;
-                int applied = runCarpet(bot.createCommandSourceStack(), "player " + BOT_NAME + " " + (action.equals("jump") ? "jump once" : action.equals("stop") ? "stop" : "move " + (action.equals("back") ? "backward" : action)));
-                stopAtTick = List.of("forward", "back", "left", "right").contains(action) ? ticks + 40 : 0;
+                CommandSourceStack source = bot.createCommandSourceStack();
+                String command = switch (action) {
+                    case "jump" -> "jump once";
+                    case "attack" -> "attack once";
+                    case "mine" -> "attack continuous";
+                    case "use" -> "use once";
+                    case "turn_left" -> "turn left";
+                    case "turn_right" -> "turn right";
+                    case "back" -> "move backward";
+                    case "sprint_forward" -> "move forward";
+                    case "stop" -> "stop";
+                    default -> "move " + action;
+                };
+                if (action.equals("sprint_forward")) runCarpet(source, "player " + BOT_NAME + " sprint");
+                int applied = runCarpet(source, "player " + BOT_NAME + " " + command);
+                stopAtTick = List.of("forward", "back", "left", "right", "sprint_forward", "mine").contains(action) ? ticks + 40 : 0;
                 return applied;
             }).get(3, TimeUnit.SECONDS);
             respond(exchange, result > 0 ? 200 : 409, Map.of("ok", result > 0));

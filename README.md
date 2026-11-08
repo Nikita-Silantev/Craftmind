@@ -2,7 +2,7 @@
 
 Craftmind is an early prototype for playing Minecraft Java Edition with a local AI agent. The target is a named, Steve-skinned companion that follows chat commands in a single-player world.
 
-Development currently happens on `dev`. The first prototype spawns a bot through Fabric Carpet and accepts simple chat commands. Resource gathering and autonomous play are not implemented yet. See [plan.md](plan.md) for the roadmap.
+Development currently happens on `dev`. The bot spawns through Fabric Carpet and reads compact observations before each action: position, health, food, inventory, targeted block, and nearby objects. The agent can take several steps per task. Block placement, crafting, and pathfinding are not implemented yet, so it must explain why it cannot build a house. See [plan.md](plan.md) for the roadmap.
 
 ## Build the prototype mod
 
