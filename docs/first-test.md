@@ -15,7 +15,7 @@ This is a prototype. Test scripted mode first, then Ollama. Use a separate test 
 3. Send `@Craftmind forward` in normal chat. The bot should move for about two seconds, stop, and reply in chat.
 4. Try `@Craftmind jump`, `@Craftmind stop`, and `@Craftmind state`.
 
-After updating `dev`, rebuild the JAR and replace the old file in `mods`. Stop the old Python agent with Ctrl+C, then start the new one. Try `@Craftmind turn left`, `@Craftmind sprint forward`, and `@Craftmind state`. In Ollama mode the agent can take up to six steps, observing after each one. New tasks are queued while the model thinks; `@Craftmind stop` cancels the current task.
+After updating `dev`, rebuild the JAR and replace the old file in `mods`. Stop the old Python agent with Ctrl+C, then start the new one. Try `@Craftmind turn left`, `@Craftmind sprint forward`, and `@Craftmind state`. In Ollama mode the model creates one plan of up to six actions per command; the agent checks the world after each action. New tasks are queued while the model plans; `@Craftmind stop` cancels the current task. Add `--no-think` to compare the same model without reasoning.
 
 If the bot does not spawn, check that Carpet and its `/player` command are available. If the agent reports a connection error, keep the world open and check `/craftmind status`. The error screenshot, `logs/latest.log`, and agent output will help debug the first run.
 

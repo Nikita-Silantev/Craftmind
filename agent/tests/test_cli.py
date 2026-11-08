@@ -1,5 +1,7 @@
 import unittest
-from craftmind.cli import scripted_action
+from unittest.mock import patch
+
+from craftmind.cli import ACTIONS, execute, ollama_plan, run_task, scripted_action
 
 
 class ScriptedActionTests(unittest.TestCase):
@@ -14,97 +16,94 @@ class ScriptedActionTests(unittest.TestCase):
         self.assertIsNone(scripted_action("построй дом"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-class BridgeProtocolTests(unittest.TestCase):
+class AgentTests(unittest.TestCase):
     def test_movement_is_followed_by_stop(self):
-        from unittest.mock import patch
-        from craftmind.cli import execute
         calls = []
-
         def fake_request(base, path, payload=None):
             calls.append((path, payload))
             return {"ok": True}
-
         with patch("craftmind.cli.bridge_request", side_effect=fake_request), patch("craftmind.cli.time.sleep"):
-            execute("http://127.0.0.1:8765", "forward")
+            execute("http://localhost", "forward", 1400)
         self.assertEqual(calls, [
-            ("/action", {"action": "forward"}),
+            ("/action", {"action": "forward", "duration_ms": 1400}),
             ("/action", {"action": "stop"}),
         ])
 
-    def test_ollama_request_uses_thinking_and_action_schema(self):
+    def test_creative_mine_uses_one_command_without_hold(self):
+        calls = []
+        def fake_request(base, path, payload=None):
+            calls.append((path, payload))
+            return {"ok": True}
+        with patch("craftmind.cli.bridge_request", side_effect=fake_request), patch("craftmind.cli.time.sleep") as sleep:
+            execute("http://localhost", "mine", 1200, "creative")
+        self.assertEqual(len(calls), 1)
+        sleep.assert_not_called()
+
+    def test_ollama_plan_uses_schema_and_can_disable_thinking(self):
         import json
-        from unittest.mock import patch
-        from craftmind.cli import PLANNER_ACTIONS, ollama_decision
-
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_):
-                return None
-
         captured = {}
-
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_): return None
         def fake_urlopen(request, timeout):
             captured.update(json.loads(request.data))
             captured["timeout"] = timeout
             return FakeResponse()
-
-        with patch("craftmind.cli.urlopen", side_effect=fake_urlopen), \
-             patch("craftmind.cli.json.load", return_value={"message": {"content": '{"action":"back","reason":"шаг назад"}'}}):
-            decision = ollama_decision("вернись назад", {"bot": "present"}, [], "qwen3:14b", "http://localhost:11434")
-        self.assertEqual(decision["action"], "back")
-        self.assertTrue(captured["think"])
-        self.assertEqual(captured["format"]["properties"]["action"]["enum"], sorted(PLANNER_ACTIONS))
+        output = {"message": {"content": '{"status":"ready","reason":"ок","steps":[{"action":"forward","duration_ms":1000}]}'}}
+        with patch("craftmind.cli.urlopen", side_effect=fake_urlopen), patch("craftmind.cli.json.load", return_value=output):
+            plan = ollama_plan("иди", {"bot": "present"}, "qwen3:14b", "http://localhost:11434", False)
+        self.assertEqual(plan["steps"][0]["action"], "forward")
+        self.assertFalse(captured["think"])
+        self.assertEqual(captured["format"]["properties"]["steps"]["items"]["properties"]["action"]["enum"], sorted(ACTIONS - {"stop"}))
         self.assertEqual(captured["timeout"], 300)
 
-    def test_task_observes_again_after_each_action(self):
-        from unittest.mock import patch
-        from craftmind.cli import run_task
+    def test_repeated_movement_is_merged_and_bounded(self):
+        output = {"message": {"content": '{"status":"ready","reason":"ок","steps":[{"action":"forward","duration_ms":2000},{"action":"forward","duration_ms":2000},{"action":"turn_left","duration_ms":200}]}'}}
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_): return None
+        with patch("craftmind.cli.urlopen", return_value=FakeResponse()), patch("craftmind.cli.json.load", return_value=output):
+            plan = ollama_plan("иди и поверни", {"bot": "present"}, "qwen3:14b", "http://localhost:11434")
+        self.assertEqual(plan["steps"], [
+            {"action": "forward", "duration_ms": 3000},
+            {"action": "turn_left", "duration_ms": 200},
+        ])
+
+    def test_plan_is_called_once_and_steps_execute_in_order(self):
         states = iter([
             {"bot": "present", "x": 0, "y": 64, "z": 0},
-            {"bot": "present", "x": 1, "y": 64, "z": 0},
-            {"bot": "present", "x": 1, "y": 64, "z": 0},
+            {"bot": "present", "x": 0, "y": 64, "z": 0},
+            {"bot": "present", "x": 2, "y": 64, "z": 0},
+            {"bot": "present", "x": 2, "y": 64, "z": 0},
+            {"bot": "present", "x": 2, "y": 64, "z": 0},
         ])
-        decisions = iter([
-            {"action": "forward", "reason": "шаг"},
-            {"action": "finish", "reason": "дошёл"},
-        ])
-        replies = []
-
+        actions = []
         def fake_request(base, path, payload=None):
-            if path == "/state":
-                return next(states)
-            if path == "/reply":
-                replies.append(payload["text"])
-                return {"ok": True}
+            if path == "/state": return next(states)
+            if path == "/action": actions.append(payload["action"])
             return {"ok": True}
-
+        plan = {"status": "ready", "reason": "ок", "steps": [
+            {"action": "forward", "duration_ms": 1000},
+            {"action": "turn_left", "duration_ms": 200},
+        ]}
         with patch("craftmind.cli.bridge_request", side_effect=fake_request), \
-             patch("craftmind.cli.ollama_decision", side_effect=lambda *args: next(decisions)), \
+             patch("craftmind.cli.ollama_plan", return_value=plan) as planner, \
              patch("craftmind.cli.time.sleep"):
-            run_task("http://localhost", "сделай шаг", "ollama", "qwen3:14b", "http://localhost:11434", 6)
-        self.assertTrue(any("Готово" in text for text in replies))
+            run_task("http://localhost", "иди и поверни", "ollama", "qwen3:14b", "http://localhost:11434", 6)
+        planner.assert_called_once()
+        self.assertEqual(actions, ["forward", "stop", "turn_left"])
 
-    def test_cancelled_task_does_not_act_after_model_reply(self):
-        from unittest.mock import patch
-        from craftmind.cli import run_task
-        checks = iter([False, True])
-        replies = []
-
+    def test_air_is_not_mined(self):
+        actions = []
         def fake_request(base, path, payload=None):
-            if path == "/state":
-                return {"bot": "present"}
-            if path == "/reply":
-                replies.append(payload["text"])
-                return {"ok": True}
-            self.fail("Cancelled task sent an action")
+            if path == "/state": return {"bot": "present", "target_block": {"id": "minecraft:air"}}
+            if path == "/action": actions.append(payload)
+            return {"ok": True}
+        plan = {"status": "ready", "reason": "ок", "steps": [{"action": "mine", "duration_ms": 1000}]}
+        with patch("craftmind.cli.bridge_request", side_effect=fake_request), patch("craftmind.cli.ollama_plan", return_value=plan):
+            run_task("http://localhost", "сломай", "ollama", "qwen3:14b", "http://localhost:11434", 6)
+        self.assertEqual(actions, [])
 
-        with patch("craftmind.cli.bridge_request", side_effect=fake_request), \
-             patch("craftmind.cli.ollama_decision", return_value={"action": "forward", "reason": "идти"}):
-            run_task("http://localhost", "иди", "ollama", "qwen3:14b", "http://localhost:11434", 6,
-                     cancelled=lambda: next(checks))
-        self.assertTrue(any("остановлена" in text for text in replies))
+
+if __name__ == "__main__":
+    unittest.main()

@@ -161,6 +161,7 @@ public final class CraftmindMod implements ModInitializer {
         state.put("health", bot.getHealth());
         state.put("food", bot.getFoodData().getFoodLevel());
         state.put("sprinting", bot.isSprinting());
+        state.put("game_mode", bot.gameMode.getGameModeForPlayer().getName());
         if (bot.pick(6, 1.0f, false) instanceof BlockHitResult hit) {
             BlockPos target = hit.getBlockPos();
             state.put("target_block", Map.of(
@@ -220,7 +221,9 @@ public final class CraftmindMod implements ModInitializer {
         try {
             JsonObject input = GSON.fromJson(new String(body, StandardCharsets.UTF_8), JsonObject.class);
             String action = input.get("action").getAsString();
-            if (!List.of("forward", "back", "left", "right", "sprint_forward", "turn_left", "turn_right", "stop", "jump", "attack", "mine", "use").contains(action)) {
+            int requestedMs = input.has("duration_ms") ? input.get("duration_ms").getAsInt() : 1200;
+            int durationMs = Math.max(200, Math.min(3000, requestedMs));
+            if (!List.of("forward", "back", "left", "right", "sprint_forward", "turn_left", "turn_right", "look_down", "look_up", "stop", "jump", "attack", "mine", "use").contains(action)) {
                 respond(exchange, 400, Map.of("error", "unknown action")); return;
             }
             int result = server.submit(() -> {
@@ -230,10 +233,12 @@ public final class CraftmindMod implements ModInitializer {
                 String command = switch (action) {
                     case "jump" -> "jump once";
                     case "attack" -> "attack once";
-                    case "mine" -> "attack continuous";
+                    case "mine" -> bot.gameMode.getGameModeForPlayer().isCreative() ? "attack once" : "attack continuous";
                     case "use" -> "use once";
                     case "turn_left" -> "turn left";
                     case "turn_right" -> "turn right";
+                    case "look_down" -> "look down";
+                    case "look_up" -> "look up";
                     case "back" -> "move backward";
                     case "sprint_forward" -> "move forward";
                     case "stop" -> "stop";
@@ -241,7 +246,9 @@ public final class CraftmindMod implements ModInitializer {
                 };
                 if (action.equals("sprint_forward")) runCarpet(source, "player " + BOT_NAME + " sprint");
                 int applied = runCarpet(source, "player " + BOT_NAME + " " + command);
-                stopAtTick = List.of("forward", "back", "left", "right", "sprint_forward", "mine").contains(action) ? ticks + 40 : 0;
+                boolean timed = List.of("forward", "back", "left", "right", "sprint_forward").contains(action)
+                    || (action.equals("mine") && !bot.gameMode.getGameModeForPlayer().isCreative());
+                stopAtTick = timed ? ticks + Math.max(1, durationMs / 50) : 0;
                 return applied;
             }).get(3, TimeUnit.SECONDS);
             respond(exchange, result > 0 ? 200 : 409, Map.of("ok", result > 0));
