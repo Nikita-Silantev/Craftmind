@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import com.mojang.brigadier.CommandDispatcher;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
@@ -26,6 +27,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
@@ -167,6 +169,7 @@ public final class CraftmindMod implements ModInitializer {
         state.put("y", Math.round(bot.getY() * 10) / 10.0);
         state.put("z", Math.round(bot.getZ() * 10) / 10.0);
         state.put("facing_degrees", bot.getYRot());
+        state.put("facing_cardinal", bot.getDirection().getName());
         state.put("health", bot.getHealth());
         state.put("food", bot.getFoodData().getFoodLevel());
         state.put("sprinting", bot.isSprinting());
@@ -183,7 +186,7 @@ public final class CraftmindMod implements ModInitializer {
         state.put("block_below", Map.of(
             "id", BuiltInRegistries.BLOCK.getKey(bot.level().getBlockState(below).getBlock()).toString(),
             "x", below.getX(), "y", below.getY(), "z", below.getZ()));
-        if (bot.pick(6, 1.0f, false) instanceof BlockHitResult hit) {
+        if (bot.pick(6, 1.0f, false) instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK) {
             BlockPos target = hit.getBlockPos();
             state.put("target_block", Map.of(
                 "id", BuiltInRegistries.BLOCK.getKey(bot.level().getBlockState(target).getBlock()).toString(),
@@ -246,14 +249,18 @@ public final class CraftmindMod implements ModInitializer {
             int durationMs = Math.max(200, Math.min(3000, requestedMs));
             String blockId = input.has("block_id") ? input.get("block_id").getAsString() : "";
             String placement = input.has("placement") ? input.get("placement").getAsString() : "front";
-            if (!List.of("forward", "back", "left", "right", "sprint_forward", "turn_left", "turn_right", "look_down", "look_up", "stop", "jump", "attack", "mine", "use", "select_block", "place").contains(action)) {
+            Integer targetX = input.has("x") ? input.get("x").getAsInt() : null;
+            Integer targetY = input.has("y") ? input.get("y").getAsInt() : null;
+            Integer targetZ = input.has("z") ? input.get("z").getAsInt() : null;
+            int count = input.has("count") ? input.get("count").getAsInt() : 0;
+            if (!List.of("forward", "back", "left", "right", "sprint_forward", "turn_left", "turn_right", "look_down", "look_up", "stop", "jump", "attack", "mine", "use", "select_block", "place", "place_at", "place_line").contains(action)) {
                 respond(exchange, 400, Map.of("error", "unknown action")); return;
             }
             Map<String, Object> result = server.submit(() -> {
                 ServerPlayer bot = server.getPlayerList().getPlayerByName(BOT_NAME);
                 if (bot == null) return actionError("Bot is absent");
                 if (action.equals("select_block")) return selectBlock(bot, blockId);
-                if (action.equals("place")) {
+                if (List.of("place", "place_at", "place_line").contains(action)) {
                     String requestedBlock = blockId;
                     if (requestedBlock.isBlank() && bot.gameMode.getGameModeForPlayer().isCreative()
                         && !(bot.getMainHandItem().getItem() instanceof BlockItem)) {
@@ -263,6 +270,13 @@ public final class CraftmindMod implements ModInitializer {
                         Map<String, Object> selected = selectBlock(bot, requestedBlock);
                         if (!Boolean.TRUE.equals(selected.get("ok"))) return selected;
                     }
+                    if (action.equals("place_at")) {
+                        if (targetX == null || targetY == null || targetZ == null) {
+                            return actionError("place_at requires integer x, y, z");
+                        }
+                        return placeBlockAt(bot, new BlockPos(targetX, targetY, targetZ));
+                    }
+                    if (action.equals("place_line")) return placeLine(bot, placement, count);
                     return placeBlock(bot, placement);
                 }
                 CommandSourceStack source = bot.createCommandSourceStack();
@@ -334,47 +348,100 @@ public final class CraftmindMod implements ModInitializer {
     }
 
     private Map<String, Object> placeBlock(ServerPlayer bot, String placement) {
-        if (!(bot.getMainHandItem().getItem() instanceof BlockItem)) {
-            return actionError("Select a block item before placing");
-        }
-        BlockHitResult hit;
         BlockPos placePos;
         if (placement.equals("target")) {
-            if (!(bot.pick(6, 1.0f, false) instanceof BlockHitResult target)) {
+            if (!(bot.pick(6, 1.0f, false) instanceof BlockHitResult target)
+                || target.getType() != HitResult.Type.BLOCK) {
                 return actionError("No block under the crosshair");
             }
-            hit = target;
             placePos = bot.level().getBlockState(target.getBlockPos()).canBeReplaced()
                 ? target.getBlockPos() : target.getBlockPos().relative(target.getDirection());
         } else {
-            Direction direction = switch (placement) {
-                case "front" -> bot.getDirection();
-                case "back" -> bot.getDirection().getOpposite();
-                case "left" -> bot.getDirection().getCounterClockWise();
-                case "right" -> bot.getDirection().getClockWise();
-                default -> null;
-            };
+            Direction direction = placementDirection(bot, placement);
             if (direction == null) return actionError("Unknown placement direction: " + placement);
-            BlockPos support = BlockPos.containing(bot.getX() + direction.getStepX(),
-                bot.getY() - 0.1, bot.getZ() + direction.getStepZ());
-            placePos = support.above();
-            if (bot.level().getBlockState(support).isAir()) return actionError("No support block " + placement);
-            hit = new BlockHitResult(new Vec3(support.getX() + 0.5, support.getY() + 1,
-                support.getZ() + 0.5), Direction.UP, support, false);
+            placePos = bot.blockPosition().relative(direction);
+        }
+        return placeBlockAt(bot, placePos);
+    }
+
+    private Direction placementDirection(ServerPlayer bot, String placement) {
+        return switch (placement) {
+            case "front" -> bot.getDirection();
+            case "back" -> bot.getDirection().getOpposite();
+            case "left" -> bot.getDirection().getCounterClockWise();
+            case "right" -> bot.getDirection().getClockWise();
+            default -> null;
+        };
+    }
+
+    private Map<String, Object> placeLine(ServerPlayer bot, String placement, int count) {
+        if (count < 2 || count > 5) return actionError("place_line count must be 2 to 5");
+        Direction direction = placementDirection(bot, placement);
+        if (direction == null) return actionError("place_line needs front, back, left or right");
+        BlockPos origin = bot.blockPosition();
+        String blockId = BuiltInRegistries.ITEM.getKey(bot.getMainHandItem().getItem()).toString();
+        List<Map<String, Integer>> positions = new ArrayList<>();
+        for (int distance = count; distance >= 1; distance--) {
+            Map<String, Object> result = placeBlockAt(bot, origin.relative(direction, distance));
+            if (!Boolean.TRUE.equals(result.get("ok"))) {
+                return actionError("Placed " + positions.size() + "/" + count + " blocks; " + result.get("error"));
+            }
+            positions.add(Map.of("x", (Integer) result.get("x"), "y", (Integer) result.get("y"),
+                "z", (Integer) result.get("z")));
+        }
+        return Map.of("ok", true, "placed_count", count, "placements", positions,
+            "placed_block", blockId);
+    }
+
+    private Map<String, Object> placeBlockAt(ServerPlayer bot, BlockPos placePos) {
+        if (!(bot.getMainHandItem().getItem() instanceof BlockItem)) {
+            return actionError("Select a block item before placing");
+        }
+        Vec3 cellCenter = new Vec3(placePos.getX() + 0.5, placePos.getY() + 0.5, placePos.getZ() + 0.5);
+        if (bot.getEyePosition().distanceToSqr(cellCenter) > 49) {
+            return actionError("Placement target is out of reach: " + placePos);
         }
         if (!bot.level().getBlockState(placePos).canBeReplaced()) {
             return actionError("Placement position is occupied: " + placePos);
         }
         Block previous = bot.level().getBlockState(placePos).getBlock();
-        InteractionResult result = bot.gameMode.useItemOn(bot, bot.level(), bot.getMainHandItem(),
-            InteractionHand.MAIN_HAND, hit);
-        Block placed = bot.level().getBlockState(placePos).getBlock();
-        if (!result.consumesAction() || placed == previous) {
-            return actionError("Block was not placed at " + placePos);
+        float originalYaw = bot.getYRot();
+        float originalPitch = bot.getXRot();
+        float originalHeadYaw = bot.getYHeadRot();
+        boolean foundSupport = false;
+        try {
+            for (Direction offset : List.of(Direction.DOWN, Direction.NORTH, Direction.SOUTH,
+                    Direction.EAST, Direction.WEST, Direction.UP)) {
+                BlockPos support = placePos.relative(offset);
+                if (bot.level().getBlockState(support).isAir()
+                    || bot.level().getBlockState(support).canBeReplaced()) continue;
+                foundSupport = true;
+                Direction face = offset.getOpposite();
+                Vec3 aim = new Vec3(support.getX() + 0.5 + face.getStepX() * 0.49,
+                    support.getY() + 0.5 + face.getStepY() * 0.49,
+                    support.getZ() + 0.5 + face.getStepZ() * 0.49);
+                if (bot.getEyePosition().distanceToSqr(aim) > 36) continue;
+                bot.lookAt(EntityAnchorArgument.Anchor.EYES, aim);
+                if (!(bot.pick(6, 1.0f, false) instanceof BlockHitResult hit)
+                    || hit.getType() != HitResult.Type.BLOCK
+                    || !hit.getBlockPos().equals(support) || hit.getDirection() != face) continue;
+                InteractionResult result = bot.gameMode.useItemOn(bot, bot.level(), bot.getMainHandItem(),
+                    InteractionHand.MAIN_HAND, hit);
+                Block placed = bot.level().getBlockState(placePos).getBlock();
+                if (result.consumesAction() && placed != previous) {
+                    bot.inventoryMenu.broadcastChanges();
+                    return Map.of("ok", true, "placed_block", BuiltInRegistries.BLOCK.getKey(placed).toString(),
+                        "x", placePos.getX(), "y", placePos.getY(), "z", placePos.getZ());
+                }
+            }
+        } finally {
+            bot.setYRot(originalYaw);
+            bot.setXRot(originalPitch);
+            bot.setYHeadRot(originalHeadYaw);
+            bot.setYBodyRot(originalYaw);
         }
-        bot.inventoryMenu.broadcastChanges();
-        return Map.of("ok", true, "placed_block", BuiltInRegistries.BLOCK.getKey(placed).toString(),
-            "x", placePos.getX(), "y", placePos.getY(), "z", placePos.getZ());
+        return actionError((foundSupport ? "No visible supporting face or placement rejected at "
+            : "No supporting block at ") + placePos);
     }
 
     private void handleReply(HttpExchange exchange) throws IOException {

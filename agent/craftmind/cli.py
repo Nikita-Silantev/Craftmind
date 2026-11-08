@@ -14,9 +14,10 @@ from urllib.request import Request, urlopen
 
 LOG = logging.getLogger("craftmind")
 MOVEMENT = {"forward", "back", "left", "right", "sprint_forward"}
-ACTIONS = MOVEMENT | {"turn_left", "turn_right", "look_down", "look_up", "jump", "stop", "attack", "mine", "use", "state", "select_block", "place"}
+ACTIONS = MOVEMENT | {"turn_left", "turn_right", "look_down", "look_up", "jump", "stop", "attack", "mine", "use", "state", "select_block", "place", "place_at", "place_line"}
 MISSING_CAPABILITIES = ("none", "craft", "pathfind", "other")
 MAX_DISTANCE_BLOCKS = 128
+PLACEMENT_ACTIONS = {"place", "place_at", "place_line"}
 
 
 def bridge_request(base: str, path: str, payload: dict | None = None) -> dict:
@@ -65,7 +66,8 @@ def describe_state(state: dict) -> str:
         return "Бот отсутствует в мире."
     lines = [
         f"Бот в точке x={state.get('x', '?')}, y={state.get('y', '?')}, z={state.get('z', '?')}; "
-        f"направление {state.get('facing_degrees', '?')}°; режим {state.get('game_mode', '?')}.",
+        f"направление {state.get('facing_cardinal', '?')} ({state.get('facing_degrees', '?')}°); "
+        f"режим {state.get('game_mode', '?')}.",
         f"Здоровье {state.get('health', '?')}; сытость {state.get('food', '?')}; "
         f"на земле: {'да' if state.get('on_ground') else 'нет' if state.get('on_ground') is False else 'неизвестно'}.",
     ]
@@ -151,8 +153,42 @@ def is_simple_distance_goal(task: str) -> bool:
         task.lower()) is not None
 
 
+def row_block_count(task: str) -> int | None:
+    words = task.lower()
+    if not any(phrase in words for phrase in ("в ряд", "линию", "in a row", "line of")):
+        return None
+    number = re.search(r"\b(\d+|два|две|три|четыре|пять|two|three|four|five)\b", words)
+    if not number:
+        return None
+    count = {"два": 2, "две": 2, "три": 3, "четыре": 4, "пять": 5,
+             "two": 2, "three": 3, "four": 4, "five": 5}.get(number.group(1))
+    count = count if count is not None else int(number.group(1))
+    return count if 2 <= count <= 5 else None
+
+
+def is_pure_placement_goal(task: str) -> bool:
+    words = task.lower()
+    return (any(verb in words for verb in ("поставь", "размести", "установи", "place"))
+            and not any(verb in words for verb in ("пройди", "иди ", "беги", "пробеги", "поверни",
+                                                    "потом", "затем", "walk", "turn", "then")))
+
+
+def row_direction(task: str, fallback: str) -> str:
+    words = task.lower()
+    if any(phrase in words for phrase in ("справа", "вправо", "to the right")):
+        return "right"
+    if any(phrase in words for phrase in ("слева", "влево", "to the left")):
+        return "left"
+    if any(phrase in words for phrase in ("сзади", "позади", "behind you")):
+        return "back"
+    if any(phrase in words for phrase in ("перед собой", "впереди", "in front")):
+        return "front"
+    return fallback if fallback in {"front", "back", "left", "right"} else "front"
+
+
 def ollama_plan(task: str, state: dict, model: str, url: str, think: bool = True,
-                history: list[str] | None = None, force_action: bool = False) -> dict:
+                history: list[str] | None = None, force_action: bool = False,
+                force_placement: bool = False) -> dict:
     prompt = (
         "Ты управляешь ботом Minecraft. Составь следующую короткую фазу плана максимум из 6 действий. "
         "ready означает, что после этих действий цель выполнена; continue — что после них нужно новое наблюдение "
@@ -168,12 +204,18 @@ def ollama_plan(task: str, state: dict, model: str, url: str, think: bool = True
         "В творческом режиме можно ходить и ломать блоки пустой рукой. "
         "select_block с block_id (например minecraft:oak_planks) выбирает блок в панели; в творческом "
         "режиме бот может взять любой доступный блок Minecraft, в выживании только имеющийся в инвентаре. "
-        "place ставит выбранный блок на землю перед ботом. Можно сразу указать block_id в place: "
-        "тогда бот сначала выберет этот блок. placement может быть front, back, left, right или target "
-        "(по блоку под прицелом); по умолчанию front. 'Поставь блок справа' означает "
-        "place с placement=right, без поворота. Для 'поставь блок' используй place, "
-        "не блуждай и не повторяй повороты. Если материал не назван и рука пуста, "
+        "Для установки блока НЕ нужно вручную поворачивать камеру или вызывать look_down: мод "
+        "сам вычисляет угол, находит видимую опору, наводит прицел и восстанавливает прежний взгляд. "
+        "place ставит один блок в соседнюю клетку; placement=front/back/left/right, по умолчанию front. "
+        "place_at ставит блок в выбранную клетку мира с целыми x,y,z в пределах досягаемости. "
+        "place_line ставит ряд из count от 2 до 5 блоков в направлении placement=front/back/left/right; "
+        "мод сам вычисляет клетки и ставит дальние блоки первыми. "
+        "Например, 'поставь три железных блока в ряд' — ОДИН place_line с "
+        "block_id=minecraft:iron_block, count=3, placement=front. "
+        "В каждом place/place_at/place_line можно указать block_id, тогда бот сначала выберет материал. "
+        "Если материал не назван и рука пуста, "
         "в творческом режиме по умолчанию будут выбраны дубовые доски. "
+        "Не ставь блок в minecraft:air без соседнего твёрдого блока-опоры. "
         "После установки проверяй результат по наблюдению. "
         "Неизвестный блок под ногами не мешает начать движение: посмотри вниз после движения. "
         "Если добыча зависит от того, что окажется под прицелом после look_down, закончи фазу "
@@ -187,19 +229,30 @@ def ollama_plan(task: str, state: dict, model: str, url: str, think: bool = True
     )
     if force_action:
         prompt += " Предыдущий отказ не подтверждён: выбери хотя бы одно доступное действие; blocked запрещён."
+    if force_placement:
+        prompt += (" Следующий план должен содержать установку блока без поворотов и look_down. "
+                   "Для ряда используй один place_line с count и block_id; для одного блока place или place_at.")
+    allowed_actions = (["place_line"] if row_block_count(task) else ["place", "place_at"])
+    if not force_placement:
+        allowed_actions = sorted(ACTIONS - {"stop"})
     schema = {
         "type": "object",
         "properties": {
             "status": {"type": "string", "enum": ["ready", "continue"] if force_action else ["ready", "continue", "blocked"]},
             "reason": {"type": "string"},
             "missing_capability": {"type": "string", "enum": MISSING_CAPABILITIES},
-            "steps": {"type": "array", "minItems": 1 if force_action else 0, "maxItems": 6, "items": {
+            "steps": {"type": "array", "minItems": 1 if force_action else 0,
+                      "maxItems": 1 if force_placement else 6, "items": {
                 "type": "object", "properties": {
-                    "action": {"type": "string", "enum": sorted(ACTIONS - {"stop"})},
+                    "action": {"type": "string", "enum": allowed_actions},
                     "duration_ms": {"type": "integer", "minimum": 200, "maximum": 3000},
                     "distance_blocks": {"type": "number", "minimum": 0.25, "maximum": MAX_DISTANCE_BLOCKS},
                     "block_id": {"type": "string"},
                     "placement": {"type": "string", "enum": ["front", "back", "left", "right", "target"]},
+                    "count": {"type": "integer", "minimum": 2, "maximum": 5},
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"},
+                    "z": {"type": "integer"},
                 }, "required": ["action", "duration_ms"], "additionalProperties": False,
             }},
         },
@@ -220,12 +273,17 @@ def ollama_plan(task: str, state: dict, model: str, url: str, think: bool = True
                          headers={"Content-Type": "application/json"}), timeout=300) as response:
         data = json.load(response)
     plan = json.loads(data["message"]["content"])
+    for step in plan["steps"]:
+        if step["action"] == "place_line" and "count" not in step and row_block_count(task):
+            step["count"] = row_block_count(task)
     if plan["status"] not in ({"ready", "continue"} if force_action else {"ready", "continue", "blocked"}):
         raise ValueError("Model returned invalid plan status")
     if plan.get("missing_capability") not in MISSING_CAPABILITIES:
         raise ValueError("Model returned invalid missing capability")
     if len(plan["steps"]) > 6:
         raise ValueError("Model returned too many steps")
+    if force_placement and (len(plan["steps"]) != 1 or plan["steps"][0]["action"] not in allowed_actions):
+        raise ValueError("Model did not return the required placement action")
     if plan["status"] != "blocked" and not plan["steps"]:
         raise ValueError("Model returned an empty actionable plan")
     for step in plan["steps"]:
@@ -236,6 +294,12 @@ def ollama_plan(task: str, state: dict, model: str, url: str, think: bool = True
             raise ValueError(f"Invalid movement distance: {step}")
         if step["action"] == "select_block" and not step.get("block_id"):
             raise ValueError("select_block requires block_id")
+        if step["action"] == "place_at" and not all(isinstance(step.get(axis), int) for axis in ("x", "y", "z")):
+            raise ValueError("place_at requires integer x, y, z")
+        if step["action"] == "place_line" and (not isinstance(step.get("count"), int)
+                                                or not 2 <= step["count"] <= 5
+                                                or step.get("placement", "front") == "target"):
+            raise ValueError("place_line requires count 2-5 and a relative direction")
     merged = []
     for step in plan["steps"]:
         if merged and step["action"] in MOVEMENT and merged[-1]["action"] == step["action"]:
@@ -248,6 +312,24 @@ def ollama_plan(task: str, state: dict, model: str, url: str, think: bool = True
                 merged.append(step.copy())
         else:
             merged.append(step.copy())
+    if any(step["action"] in {"place", "place_at", "place_line"} for step in merged) and "mine" not in {
+            step["action"] for step in merged} and not any(phrase in task.lower() for phrase in (
+            "смотри вниз", "посмотри вниз", "look down")):
+        merged = [step for step in merged if step["action"] not in {"look_down", "look_up"}]
+    if is_pure_placement_goal(task) and any(step["action"] in PLACEMENT_ACTIONS for step in merged):
+        merged = [step for step in merged if step["action"] not in {"turn_left", "turn_right"}]
+    row_count = row_block_count(task)
+    if row_count and is_pure_placement_goal(task):
+        placement = next((step for step in merged if step["action"] in PLACEMENT_ACTIONS), None)
+        if placement is not None:
+            material = placement.get("block_id") or next((step.get("block_id") for step in merged
+                if step["action"] == "select_block" and step.get("block_id")), None)
+            line = {"action": "place_line", "duration_ms": placement["duration_ms"],
+                    "count": row_count, "placement": row_direction(task, placement.get("placement", "front"))}
+            if material:
+                line["block_id"] = material
+            merged = [line]
+            plan["status"] = "ready"
     normalize_explicit_distance(task, merged, history or [])
     plan["steps"] = merged
     LOG.info("Model plan: status=%s missing=%s reason=%s steps=%s", plan["status"],
@@ -294,7 +376,9 @@ def move_distance(base: str, action: str, distance_blocks: float,
 
 def execute(base: str, action: str, duration_ms: int = 1200, game_mode: str = "survival",
             distance_blocks: float | None = None, block_id: str | None = None,
-            placement: str = "front", cancelled: Callable[[], bool] = lambda: False) -> dict:
+            placement: str = "front", count: int | None = None,
+            x: int | None = None, y: int | None = None, z: int | None = None,
+            cancelled: Callable[[], bool] = lambda: False) -> dict:
     if action == "state":
         return bridge_request(base, "/state")
     if action not in ACTIONS:
@@ -303,10 +387,18 @@ def execute(base: str, action: str, duration_ms: int = 1200, game_mode: str = "s
         return move_distance(base, action, distance_blocks, cancelled)
     duration_ms = max(200, min(3000, duration_ms))
     payload = {"action": action, "duration_ms": duration_ms}
-    if block_id and action in {"select_block", "place"}:
+    if block_id and action in {"select_block", "place", "place_at", "place_line"}:
         payload["block_id"] = block_id
-    if action == "place":
+    if action in {"place", "place_line"}:
         payload["placement"] = placement
+    if action == "place_line":
+        if count is None:
+            raise ValueError("place_line требует count")
+        payload["count"] = count
+    if action == "place_at":
+        if any(axis is None for axis in (x, y, z)):
+            raise ValueError("place_at требует x, y, z")
+        payload.update({"x": x, "y": y, "z": z})
     result = bridge_request(base, "/action", payload)
     if not result.get("ok", True):
         raise ValueError(result.get("error", "Действие не выполнено"))
@@ -363,7 +455,16 @@ def run_task(base: str, task: str, mode: str, model: str, ollama: str, max_steps
                 LOG.info("Deferring unavailable %s until useful actions run", capability)
             else:
                 LOG.warning("Unverified model refusal; requesting an actionable plan: %s", plan["reason"])
-            plan = ollama_plan(task, observation, model, ollama, think, history, force_action=True)
+            plan = ollama_plan(task, observation, model, ollama, think, history,
+                               force_action=True, force_placement=is_pure_placement_goal(task))
+            if cancelled():
+                reply(base, "Задача остановлена.")
+                return
+        if mode == "ollama" and is_pure_placement_goal(task) and not any(
+                step["action"] in PLACEMENT_ACTIONS for step in plan["steps"]):
+            LOG.warning("Planner chose no placement action; requesting a placement plan")
+            plan = ollama_plan(task, observation, model, ollama, think, history,
+                               force_action=True, force_placement=True)
             if cancelled():
                 reply(base, "Задача остановлена.")
                 return
@@ -385,7 +486,8 @@ def run_task(base: str, task: str, mode: str, model: str, ollama: str, max_steps
                     raise ValueError("Под прицелом воздух, ломать нечего")
                 result = execute(base, action, step["duration_ms"], before.get("game_mode", "survival"),
                                  distance_blocks=step.get("distance_blocks"), block_id=step.get("block_id"),
-                                 placement=step.get("placement", "front"), cancelled=cancelled)
+                                 placement=step.get("placement", "front"), count=step.get("count"),
+                                 x=step.get("x"), y=step.get("y"), z=step.get("z"), cancelled=cancelled)
             except ValueError as error:
                 if cancelled():
                     return
@@ -409,8 +511,12 @@ def run_task(base: str, task: str, mode: str, model: str, ollama: str, max_steps
             after = bridge_request(base, "/state")
             completed_count += 1
             detail = f" distance={result['distance_moved']:.1f} blocks" if "distance_moved" in result else ""
-            if action in {"select_block", "place"}:
+            if action in {"select_block", "place", "place_at", "place_line"}:
                 detail += f" block={result.get('block_id', result.get('placed_block', step.get('block_id', '?')))}"
+            if action in {"place", "place_at"} and all(axis in result for axis in ("x", "y", "z")):
+                detail += f" at=({result['x']},{result['y']},{result['z']})"
+            if action == "place_line":
+                detail += f" count={result.get('placed_count', step.get('count', '?'))} positions={result.get('placements', [])}"
             history.append(f"{completed_count}. {action} {detail} x={after.get('x', '?')}, y={after.get('y', '?')}, z={after.get('z', '?')}")
             history = history[-16:]
             recent_actions.append(action)

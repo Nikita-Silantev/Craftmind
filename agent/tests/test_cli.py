@@ -114,6 +114,79 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(calls, [("/action", {"action": "place", "duration_ms": 1200,
                                                "block_id": "minecraft:oak_planks", "placement": "right"})])
 
+    def test_placement_at_coordinates_sends_exact_target(self):
+        calls = []
+        def fake_request(base, path, payload=None):
+            calls.append((path, payload))
+            return {"ok": True, "placed_block": "minecraft:iron_block", "x": 12, "y": 4, "z": -3}
+        with patch("craftmind.cli.bridge_request", side_effect=fake_request):
+            result = execute("http://localhost", "place_at", block_id="minecraft:iron_block",
+                             x=12, y=4, z=-3)
+        self.assertEqual((result["x"], result["y"], result["z"]), (12, 4, -3))
+        self.assertEqual(calls, [("/action", {"action": "place_at", "duration_ms": 1200,
+                                               "block_id": "minecraft:iron_block", "x": 12, "y": 4, "z": -3})])
+
+    def test_three_block_row_is_one_plan_action(self):
+        calls = []
+        positions = [{"x": 3, "y": 4, "z": 0}, {"x": 2, "y": 4, "z": 0}, {"x": 1, "y": 4, "z": 0}]
+        def fake_request(base, path, payload=None):
+            calls.append((path, payload))
+            return {"ok": True, "placed_block": "minecraft:iron_block",
+                    "placed_count": 3, "placements": positions}
+        with patch("craftmind.cli.bridge_request", side_effect=fake_request):
+            result = execute("http://localhost", "place_line", block_id="minecraft:iron_block",
+                             placement="front", count=3)
+        self.assertEqual(result["placements"], positions)
+        self.assertEqual(calls, [("/action", {"action": "place_line", "duration_ms": 1200,
+                                               "block_id": "minecraft:iron_block", "placement": "front", "count": 3})])
+
+    def test_planner_removes_manual_look_before_row_placement(self):
+        output = {"message": {"content": '{"status":"ready","reason":"ставлю ряд","missing_capability":"none","steps":[{"action":"look_down","duration_ms":200},{"action":"place_line","duration_ms":200,"block_id":"minecraft:iron_block","placement":"front","count":3}]}'}}
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_): return None
+        with patch("craftmind.cli.urlopen", return_value=FakeResponse()), \
+             patch("craftmind.cli.json.load", return_value=output):
+            plan = ollama_plan("поставь три железных блока в ряд", {"bot": "present"},
+                               "qwen3:14b", "http://localhost:11434")
+        self.assertEqual([step["action"] for step in plan["steps"]], ["place_line"])
+
+    def test_repeated_single_places_become_one_row_action(self):
+        output = {"message": {"content": '{"status":"ready","reason":"ставлю","missing_capability":"none","steps":[{"action":"place","duration_ms":200,"block_id":"minecraft:iron_block"},{"action":"place","duration_ms":200,"block_id":"minecraft:iron_block"},{"action":"place","duration_ms":200,"block_id":"minecraft:iron_block"}]}'}}
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_): return None
+        with patch("craftmind.cli.urlopen", return_value=FakeResponse()), \
+             patch("craftmind.cli.json.load", return_value=output):
+            plan = ollama_plan("поставь три железных блока в ряд", {"bot": "present"},
+                               "qwen3:14b", "http://localhost:11434")
+        self.assertEqual(plan["steps"], [{"action": "place_line", "duration_ms": 200,
+                                          "count": 3, "placement": "front", "block_id": "minecraft:iron_block"}])
+
+    def test_turn_only_placement_plan_is_replaced_before_execution(self):
+        actions = []
+        def fake_request(base, path, payload=None):
+            if path == "/state": return {"bot": "present", "x": 0, "y": 4, "z": 0}
+            if path == "/action":
+                actions.append(payload["action"])
+                return {"ok": True, "placed_block": "minecraft:iron_block", "placed_count": 3,
+                        "placements": [{"x": i, "y": 4, "z": 0} for i in (3, 2, 1)]}
+            return {"ok": True}
+        turns = {"status": "ready", "reason": "смотрю", "steps": [
+            {"action": "turn_right", "duration_ms": 200},
+            {"action": "look_down", "duration_ms": 200},
+        ]}
+        row = {"status": "ready", "reason": "ставлю ряд", "steps": [
+            {"action": "place_line", "duration_ms": 200, "block_id": "minecraft:iron_block",
+             "count": 3, "placement": "front"},
+        ]}
+        with patch("craftmind.cli.bridge_request", side_effect=fake_request), \
+             patch("craftmind.cli.ollama_plan", side_effect=[turns, row]) as planner:
+            run_task("http://localhost", "поставь три железных блока в ряд", "ollama",
+                     "qwen3:14b", "http://localhost:11434", 128)
+        self.assertEqual(actions, ["place_line"])
+        self.assertTrue(planner.call_args_list[1].kwargs["force_placement"])
+
     def test_bridge_reports_failed_placement(self):
         with patch("craftmind.cli.bridge_request", return_value={"ok": False, "error": "No support block front"}):
             with self.assertRaisesRegex(ValueError, "No support block front"):
@@ -335,7 +408,7 @@ class AgentTests(unittest.TestCase):
         ]} for i in range(20))
         with patch("craftmind.cli.bridge_request", side_effect=fake_request), \
              patch("craftmind.cli.ollama_plan", side_effect=plans) as planner:
-            run_task("http://localhost", "поставь блок", "ollama", "qwen3:14b", "http://localhost:11434", 128)
+            run_task("http://localhost", "осмотрись", "ollama", "qwen3:14b", "http://localhost:11434", 128)
         self.assertEqual(planner.call_count, 6)
         self.assertIn("повторяет повороты", replies[-1])
 
