@@ -13,11 +13,20 @@ import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -163,6 +172,13 @@ public final class CraftmindMod implements ModInitializer {
         state.put("sprinting", bot.isSprinting());
         state.put("game_mode", bot.gameMode.getGameModeForPlayer().getName());
         state.put("on_ground", bot.onGround());
+        state.put("selected_slot", bot.getInventory().getSelectedSlot());
+        state.put("held_item", BuiltInRegistries.ITEM.getKey(bot.getMainHandItem().getItem()).toString());
+        List<String> hotbar = new ArrayList<>();
+        for (int slot = 0; slot < 9; slot++) {
+            hotbar.add(BuiltInRegistries.ITEM.getKey(bot.getInventory().getItem(slot).getItem()).toString());
+        }
+        state.put("hotbar", hotbar);
         BlockPos below = BlockPos.containing(bot.getX(), bot.getY() - 0.1, bot.getZ());
         state.put("block_below", Map.of(
             "id", BuiltInRegistries.BLOCK.getKey(bot.level().getBlockState(below).getBlock()).toString(),
@@ -228,12 +244,27 @@ public final class CraftmindMod implements ModInitializer {
             String action = input.get("action").getAsString();
             int requestedMs = input.has("duration_ms") ? input.get("duration_ms").getAsInt() : 1200;
             int durationMs = Math.max(200, Math.min(3000, requestedMs));
-            if (!List.of("forward", "back", "left", "right", "sprint_forward", "turn_left", "turn_right", "look_down", "look_up", "stop", "jump", "attack", "mine", "use").contains(action)) {
+            String blockId = input.has("block_id") ? input.get("block_id").getAsString() : "";
+            String placement = input.has("placement") ? input.get("placement").getAsString() : "front";
+            if (!List.of("forward", "back", "left", "right", "sprint_forward", "turn_left", "turn_right", "look_down", "look_up", "stop", "jump", "attack", "mine", "use", "select_block", "place").contains(action)) {
                 respond(exchange, 400, Map.of("error", "unknown action")); return;
             }
-            int result = server.submit(() -> {
+            Map<String, Object> result = server.submit(() -> {
                 ServerPlayer bot = server.getPlayerList().getPlayerByName(BOT_NAME);
-                if (bot == null) return 0;
+                if (bot == null) return actionError("Bot is absent");
+                if (action.equals("select_block")) return selectBlock(bot, blockId);
+                if (action.equals("place")) {
+                    String requestedBlock = blockId;
+                    if (requestedBlock.isBlank() && bot.gameMode.getGameModeForPlayer().isCreative()
+                        && !(bot.getMainHandItem().getItem() instanceof BlockItem)) {
+                        requestedBlock = "minecraft:oak_planks";
+                    }
+                    if (!requestedBlock.isBlank()) {
+                        Map<String, Object> selected = selectBlock(bot, requestedBlock);
+                        if (!Boolean.TRUE.equals(selected.get("ok"))) return selected;
+                    }
+                    return placeBlock(bot, placement);
+                }
                 CommandSourceStack source = bot.createCommandSourceStack();
                 String command = switch (action) {
                     case "jump" -> "jump once";
@@ -254,10 +285,96 @@ public final class CraftmindMod implements ModInitializer {
                 boolean timed = List.of("forward", "back", "left", "right", "sprint_forward").contains(action)
                     || (action.equals("mine") && !bot.gameMode.getGameModeForPlayer().isCreative());
                 stopAtTick = timed ? ticks + Math.max(1, durationMs / 50) : 0;
-                return applied;
+                return applied > 0 ? Map.<String, Object>of("ok", true) : actionError("Carpet action unavailable");
             }).get(3, TimeUnit.SECONDS);
-            respond(exchange, result > 0 ? 200 : 409, Map.of("ok", result > 0));
+            respond(exchange, 200, result);
         } catch (Exception e) { respond(exchange, 400, Map.of("error", e.toString())); }
+    }
+
+    private static Map<String, Object> actionError(String message) {
+        return Map.of("ok", false, "error", message);
+    }
+
+    private Map<String, Object> selectBlock(ServerPlayer bot, String blockId) {
+        Identifier id = Identifier.tryParse(blockId);
+        if (id == null) return actionError("Invalid block id: " + blockId);
+        Block block = BuiltInRegistries.BLOCK.getOptional(id).orElse(null);
+        if (block == null || !(block.asItem() instanceof BlockItem)) {
+            return actionError("Block item is unavailable: " + blockId);
+        }
+        Item item = block.asItem();
+        Inventory inventory = bot.getInventory();
+        int found = -1;
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            if (inventory.getItem(slot).is(item)) { found = slot; break; }
+        }
+        if (found >= 0 && found < 9) {
+            inventory.setSelectedSlot(found);
+            inventory.setChanged();
+            bot.inventoryMenu.broadcastChanges();
+            return Map.of("ok", true, "block_id", id.toString(), "slot", found);
+        }
+        int hotbarSlot = inventory.getSelectedSlot();
+        for (int slot = 0; slot < 9; slot++) {
+            if (inventory.getItem(slot).isEmpty()) { hotbarSlot = slot; break; }
+        }
+        if (found >= 9) {
+            ItemStack previous = inventory.getItem(hotbarSlot);
+            inventory.setItem(hotbarSlot, inventory.getItem(found));
+            inventory.setItem(found, previous);
+        } else if (bot.gameMode.getGameModeForPlayer().isCreative()) {
+            inventory.setItem(hotbarSlot, new ItemStack(item, 64));
+        } else {
+            return actionError("Block is not in the bot inventory: " + blockId);
+        }
+        inventory.setSelectedSlot(hotbarSlot);
+        inventory.setChanged();
+        bot.inventoryMenu.broadcastChanges();
+        return Map.of("ok", true, "block_id", id.toString(), "slot", hotbarSlot);
+    }
+
+    private Map<String, Object> placeBlock(ServerPlayer bot, String placement) {
+        if (!(bot.getMainHandItem().getItem() instanceof BlockItem)) {
+            return actionError("Select a block item before placing");
+        }
+        BlockHitResult hit;
+        BlockPos placePos;
+        if (placement.equals("target")) {
+            if (!(bot.pick(6, 1.0f, false) instanceof BlockHitResult target)) {
+                return actionError("No block under the crosshair");
+            }
+            hit = target;
+            placePos = bot.level().getBlockState(target.getBlockPos()).canBeReplaced()
+                ? target.getBlockPos() : target.getBlockPos().relative(target.getDirection());
+        } else {
+            Direction direction = switch (placement) {
+                case "front" -> bot.getDirection();
+                case "back" -> bot.getDirection().getOpposite();
+                case "left" -> bot.getDirection().getCounterClockWise();
+                case "right" -> bot.getDirection().getClockWise();
+                default -> null;
+            };
+            if (direction == null) return actionError("Unknown placement direction: " + placement);
+            BlockPos support = BlockPos.containing(bot.getX() + direction.getStepX(),
+                bot.getY() - 0.1, bot.getZ() + direction.getStepZ());
+            placePos = support.above();
+            if (bot.level().getBlockState(support).isAir()) return actionError("No support block " + placement);
+            hit = new BlockHitResult(new Vec3(support.getX() + 0.5, support.getY() + 1,
+                support.getZ() + 0.5), Direction.UP, support, false);
+        }
+        if (!bot.level().getBlockState(placePos).canBeReplaced()) {
+            return actionError("Placement position is occupied: " + placePos);
+        }
+        Block previous = bot.level().getBlockState(placePos).getBlock();
+        InteractionResult result = bot.gameMode.useItemOn(bot, bot.level(), bot.getMainHandItem(),
+            InteractionHand.MAIN_HAND, hit);
+        Block placed = bot.level().getBlockState(placePos).getBlock();
+        if (!result.consumesAction() || placed == previous) {
+            return actionError("Block was not placed at " + placePos);
+        }
+        bot.inventoryMenu.broadcastChanges();
+        return Map.of("ok", true, "placed_block", BuiltInRegistries.BLOCK.getKey(placed).toString(),
+            "x", placePos.getX(), "y", placePos.getY(), "z", placePos.getZ());
     }
 
     private void handleReply(HttpExchange exchange) throws IOException {
