@@ -44,12 +44,19 @@ def ollama_action(task: str, state: dict, model: str, url: str) -> str:
               "Поворот пока не реализован: left/right означает шаг в сторону. "
               "Если задача сложнее одного действия, выбери state. "
               "Любое движение длится 2 секунды. Не обещай добычу или строительство.")
-    body = json.dumps({"model": model, "stream": False, "format": "json", "messages": [
+    action_schema = {
+        "type": "object",
+        "properties": {"action": {"type": "string", "enum": sorted(ACTIONS)}},
+        "required": ["action"],
+        "additionalProperties": False,
+    }
+    body = json.dumps({"model": model, "stream": False, "think": True,
+                       "format": action_schema, "options": {"num_ctx": 4096}, "messages": [
         {"role": "system", "content": prompt},
         {"role": "user", "content": json.dumps({"task": task, "state": state}, ensure_ascii=False)},
     ]}).encode()
     with urlopen(Request(url.rstrip("/") + "/api/chat", data=body,
-                         headers={"Content-Type": "application/json"}), timeout=120) as response:
+                         headers={"Content-Type": "application/json"}), timeout=300) as response:
         data = json.load(response)
     action = json.loads(data["message"]["content"])["action"]
     if action not in ACTIONS:
@@ -74,7 +81,7 @@ def execute(base: str, action: str, seconds: float = 2.0) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Craftmind agent")
     parser.add_argument("--mode", choices=("scripted", "ollama"), default="scripted")
-    parser.add_argument("--model", default="qwen3:8b")
+    parser.add_argument("--model", default="qwen3:14b")
     parser.add_argument("--bridge", default="http://127.0.0.1:8765")
     parser.add_argument("--ollama", default="http://127.0.0.1:11434")
     args = parser.parse_args()

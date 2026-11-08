@@ -19,4 +19,4 @@ If the bot does not spawn, check that Carpet and its `/player` command are avail
 
 ## Local model check
 
-Install [Ollama](https://ollama.com/download/windows), then run `ollama pull qwen3:8b`. Stop the scripted agent and run `py -m craftmind.cli --mode ollama --model qwen3:8b` from `agent`. Repeat a simple chat command. The model currently selects one action from a short list. This checks model connectivity, not full autonomy.
+Install [Ollama](https://ollama.com/download/windows), then run `ollama pull qwen3:14b`. Stop the scripted agent and run `py -3.14 -m craftmind.cli --mode ollama --model qwen3:14b` from `agent`. Repeat a simple chat command. The agent enables model thinking and asks it to choose one action from a short list. New game actions such as sprinting and mining require code changes.

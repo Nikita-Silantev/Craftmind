@@ -31,3 +31,29 @@ class BridgeProtocolTests(unittest.TestCase):
             ("/action", {"action": "forward"}),
             ("/action", {"action": "stop"}),
         ])
+
+    def test_ollama_request_uses_thinking_and_action_schema(self):
+        import json
+        from unittest.mock import patch
+        from craftmind.cli import ACTIONS, ollama_action
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured.update(json.loads(request.data))
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with patch("craftmind.cli.urlopen", side_effect=fake_urlopen), \
+             patch("craftmind.cli.json.load", return_value={"message": {"content": '{"action":"back"}'}}):
+            self.assertEqual(ollama_action("вернись назад", {"bot": "present"}, "qwen3:14b", "http://localhost:11434"), "back")
+        self.assertTrue(captured["think"])
+        self.assertEqual(captured["format"]["properties"]["action"]["enum"], sorted(ACTIONS))
+        self.assertEqual(captured["timeout"], 300)
