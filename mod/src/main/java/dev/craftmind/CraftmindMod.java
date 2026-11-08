@@ -162,6 +162,11 @@ public final class CraftmindMod implements ModInitializer {
         state.put("food", bot.getFoodData().getFoodLevel());
         state.put("sprinting", bot.isSprinting());
         state.put("game_mode", bot.gameMode.getGameModeForPlayer().getName());
+        state.put("on_ground", bot.onGround());
+        BlockPos below = BlockPos.containing(bot.getX(), bot.getY() - 0.1, bot.getZ());
+        state.put("block_below", Map.of(
+            "id", BuiltInRegistries.BLOCK.getKey(bot.level().getBlockState(below).getBlock()).toString(),
+            "x", below.getX(), "y", below.getY(), "z", below.getZ()));
         if (bot.pick(6, 1.0f, false) instanceof BlockHitResult hit) {
             BlockPos target = hit.getBlockPos();
             state.put("target_block", Map.of(

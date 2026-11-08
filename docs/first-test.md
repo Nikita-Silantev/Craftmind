@@ -15,10 +15,10 @@ This is a prototype. Test scripted mode first, then Ollama. Use a separate test 
 3. Send `@Craftmind forward` in normal chat. The bot should move for about two seconds, stop, and reply in chat.
 4. Try `@Craftmind jump`, `@Craftmind stop`, and `@Craftmind state`.
 
-After updating `dev`, rebuild the JAR and replace the old file in `mods`. Stop the old Python agent with Ctrl+C, then start the new one. Try `@Craftmind turn left`, `@Craftmind sprint forward`, and `@Craftmind state`. In Ollama mode the model creates one plan of up to six actions per command; the agent checks the world after each action. New tasks are queued while the model plans; `@Craftmind stop` cancels the current task. Add `--no-think` to compare the same model without reasoning.
+After updating `dev`, rebuild the JAR, replace the old file in `mods`, and restart Minecraft. Stop the old Python agent with Ctrl+C, then start the new one. Use `/craftmind spawn` to create the bot; `@Craftmind spawn` is a chat task, not the spawn command. Try `@Craftmind turn left`, `@Craftmind sprint forward`, and `@Craftmind state`. In Ollama mode the model can plan in short phases. The agent checks the world after each action and sends a new observation when another phase is needed. An unsupported refusal is challenged with a new plan. New tasks are queued while the model plans; `@Craftmind stop` cancels the current task. Add `--no-think` to compare the same model without reasoning.
 
 If the bot does not spawn, check that Carpet and its `/player` command are available. If the agent reports a connection error, keep the world open and check `/craftmind status`. The error screenshot, `logs/latest.log`, and agent output will help debug the first run.
 
 ## Local model check
 
-Install [Ollama](https://ollama.com/download/windows), then run `ollama pull qwen3:14b`. Stop the scripted agent and run `py -3.14 -m craftmind.cli --mode ollama --model qwen3:14b` from `agent`. Repeat a simple chat command. The agent enables model thinking and asks it to choose one action from a short list. New game actions such as sprinting and mining require code changes.
+Install [Ollama](https://ollama.com/download/windows), then run `ollama pull qwen3:14b`. Stop the scripted agent and run `py -3.14 -m craftmind.cli --mode ollama --model qwen3:14b` from `agent`. Try a walk and turn, then a walk, turn, and mine. Before mining, the bot should look down, observe the target, and plan the next phase. If it stops, capture its in-game reply and the Python log lines containing `Model plan` and `Step`.
